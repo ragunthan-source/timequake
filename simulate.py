@@ -1,13 +1,12 @@
 """TimeQuake Demo Traffic Generation Script.
 
-Generates normal baseline traffic and fault-injected traffic to demonstrate
-causal-graph based root-cause analysis (RCA) and compensating rollbacks.
+Generates normal baseline traffic and can arm a live, post-startup fault to
+demonstrate causal-graph based root-cause analysis (RCA) and rollbacks.
 
 Usage:
     python simulate.py                        # sends 20 normal baseline requests
-    python simulate.py --fault inventory      # sends normal baseline + 1 fault run on inventory
-    python simulate.py --fault payment        # sends normal baseline + 1 fault run on payment
-    python simulate.py --single --fault cart  # sends single fault run on cart
+    python simulate.py --fault inventory      # arms inventory live, then sends a request
+    python simulate.py --single --fault cart  # skips baseline, then arms cart live
 """
 
 import sys
@@ -31,14 +30,6 @@ def load_chain_config():
         return None
 
 
-def save_chain_config(cfg):
-    try:
-        with open(CHAIN_CONFIG, 'w') as f:
-            json.dump(cfg, f, indent=2)
-    except Exception as e:
-        print(f"[ERROR] Could not save chain config: {e}")
-
-
 def send_hop(trace_id=None, fault_run=False):
     """Send a POST /hop request to the API gateway (which proxies to auth)."""
     url = f"{BASE_URL}/hop"
@@ -47,9 +38,6 @@ def send_hop(trace_id=None, fault_run=False):
     }
     if trace_id:
         headers["X-Trace-Id"] = trace_id
-    if fault_run:
-        headers["X-Fault-Run"] = "true"
-
     data = json.dumps({}).encode('utf-8')
     req = urllib.request.Request(url, data=data, headers=headers, method='POST')
 
@@ -78,14 +66,37 @@ def fetch_api(path):
         return {"error": str(e)}
 
 
+def arm_live_fault(service, delay_ms):
+    """Use the running API to arm a service's next request without changing config."""
+    req = urllib.request.Request(
+        f"{BASE_URL}/api/fault",
+        data=json.dumps({"service": service, "delay_ms": delay_ms}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8")), response.status
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8") if error.fp else "{}"
+        try:
+            return json.loads(body), error.code
+        except Exception:
+            return {"error": str(error)}, error.code
+    except Exception as error:
+        return {"error": str(error)}, None
+
+
 def main():
     parser = argparse.ArgumentParser(description="TimeQuake Traffic Generator & Demo Suite")
     parser.add_argument("--fault", type=str, default=None,
-                        help="Service to inject fault into (e.g. inventory, payment, cart)")
+                        help="Arm this running service via POST /api/fault before the next request")
+    parser.add_argument("--delay-ms", type=int, default=1500,
+                        help="Live injected delay in milliseconds (default: 1500)")
     parser.add_argument("--normal", type=int, default=20,
                         help="Number of normal requests to send for baseline building (default: 20)")
     parser.add_argument("--single", action="store_true",
-                        help="Send single fault-injected request only (skip baseline phase)")
+                        help="Skip baseline traffic and send only the requested live test")
     args = parser.parse_args()
 
     cfg = load_chain_config()
@@ -93,12 +104,9 @@ def main():
         print("[ERROR] Could not load chain_config.json")
         sys.exit(1)
 
-    if args.fault:
-        if args.fault not in cfg.get("services", []):
-            print(f"[WARNING] Fault service '{args.fault}' not in configured chain: {cfg.get('services')}")
-        cfg["default_fault_service"] = args.fault
-        save_chain_config(cfg)
-        print(f"[CONFIG] Target fault service set to: '{args.fault}'")
+    if args.fault and args.fault not in cfg.get("services", []):
+        print(f"[ERROR] Fault service '{args.fault}' is not in configured chain: {cfg.get('services')}")
+        sys.exit(2)
 
     print("\n" + "=" * 65)
     print("           TIMEQUAKE TIME-TRAVEL DEBUGGER DEMO")
@@ -120,14 +128,19 @@ def main():
         print(f"[PHASE 1] Recorded {args.normal} normal traces for baseline calculation.")
 
     # Phase 2: Fault Injection
-    if args.fault or args.single:
-        target_svc = args.fault or cfg.get("default_fault_service", "inventory")
-        print(f"\n[PHASE 2] Injecting Artificial Fault into Service '{target_svc}'...")
+    if args.fault:
+        target_svc = args.fault
+        print(f"\n[PHASE 2] Arming live fault for running service '{target_svc}'...")
+        armed, arm_status = arm_live_fault(target_svc, args.delay_ms)
+        if arm_status != 201:
+            print(f"[ERROR] Could not arm live fault: {armed.get('error', armed)}")
+            sys.exit(1)
+        print(f"[LIVE] {armed.get('message')} ({args.delay_ms}ms delay)")
         fault_trace_id = f"fault_{int(time.time())}"
         
-        print(f"--> Sending fault-injected request (X-Fault-Run: true)...")
+        print("--> Sending the next real request through the running chain...")
         t0 = time.time()
-        res, status = send_hop(trace_id=fault_trace_id, fault_run=True)
+        res, status = send_hop(trace_id=fault_trace_id)
         t_elapsed = round(time.time() - t0, 3)
         actual_tid = res.get("trace_id", fault_trace_id)
         trace_ids.append(actual_tid)
@@ -148,7 +161,8 @@ def main():
             print(f"  Visible Symptom Service : {analysis.get('symptom_service', 'N/A')}")
             print(f"  Flagged ROOT CAUSE      : {analysis.get('root_cause_service', 'N/A')}")
             print(f"  Cascade Path            : {' -> '.join(analysis.get('cascade_path', []))}")
-            print(f"  Upstream Rollbacks      : {len(analysis.get('rollback_events', []))} compensating event(s)")
+            rollbacks = analysis.get("rollbacks", [])
+            print(f"  Upstream Rollbacks      : {len(rollbacks)} persisted compensating event(s)")
             print("\n  Plain-English Explanation:")
             print(f"  \"{analysis.get('explanation', '')}\"")
 
@@ -164,10 +178,10 @@ def main():
                 is_anom = "YES (ROOT CAUSE)" if node.get("is_root_cause") else ("YES (CASCADE)" if node.get("is_cascade") else "No")
                 print(f"  {svc:<14} {dur:<10} {st:<10} {bm:<14} {zs:<10} {is_anom}")
 
-            if analysis.get("rollback_events"):
-                print("\n  Compensating Rollback Actions (Saga Pattern):")
-                for rb in analysis["rollback_events"]:
-                    print(f"  [ROLLBACK] Service '{rb['service']}' -> Reason: {rb['reason']}")
+            if rollbacks:
+                print("\n  Persisted Compensating Rollback Actions (Saga Pattern):")
+                for rb in rollbacks:
+                    print(f"  [ROLLBACK] Service '{rb['service']}' [{rb['status']}] -> Reason: {rb['reason']}")
 
             print("-" * 65)
 

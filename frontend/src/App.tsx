@@ -1,51 +1,41 @@
-import React, { useEffect, useState, useMemo } from "react";
-import { BrowserRouter as Router, Routes, Route, Link, useParams, useNavigate } from "react-router-dom";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { BrowserRouter as Router, Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import "./index.css";
 
-/* ==== API Helper ==== */
 const API_BASE = "";
+const POLL_INTERVAL_MS = 5000;
+const LIVE_POLL_INTERVAL_MS = 1000;
 
 const api = {
-  getChain: () => fetch(`${API_BASE}/api/chain`).then((r) => r.json()),
-  getHealth: () => fetch(`${API_BASE}/api/health`).then((r) => r.json()),
-  getTraces: () => fetch(`${API_BASE}/api/traces`).then((r) => r.json()),
-  getTrace: (id: string) => fetch(`${API_BASE}/api/trace/${id}`).then((r) => r.json()),
-  getAnomalies: () => fetch(`${API_BASE}/api/anomalies`).then((r) => r.json()),
-  getIncidents: () => fetch(`${API_BASE}/api/incidents`).then((r) => r.json()),
-  triggerHop: (faultRun = false, faultService?: string) => {
-    // If faultService specified, update fault service first
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (faultRun) headers["X-Fault-Run"] = "true";
-    return fetch(`${API_BASE}/hop`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({}),
-    }).then((r) => r.json());
-  },
+  getChain: () => fetch(`${API_BASE}/api/chain`).then((response) => response.json()),
+  getHealth: () => fetch(`${API_BASE}/api/health`).then((response) => response.json()),
+  getTraces: () => fetch(`${API_BASE}/api/traces`).then((response) => response.json()),
+  getTrace: (id: string) => fetch(`${API_BASE}/api/trace/${id}`).then((response) => response.json()),
+  getAnomalies: () => fetch(`${API_BASE}/api/anomalies`).then((response) => response.json()),
+  getIncidents: () => fetch(`${API_BASE}/api/incidents`).then((response) => response.json()),
+  getFaults: () => fetch(`${API_BASE}/api/fault`).then((response) => response.json()),
+  getMonitorEvents: (service: string) => fetch(`${API_BASE}/api/monitor-events?service=${encodeURIComponent(service)}`).then((response) => response.json()),
+  saveMonitorConfig: (service: string, config: any) => fetch(`${API_BASE}/api/service/${encodeURIComponent(service)}/monitor-config`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config) }).then((response) => response.json()),
+  setOverride: (service: string, state: "auto" | "normal" | "error") => fetch(`${API_BASE}/api/service/${encodeURIComponent(service)}/override`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state }) }).then((response) => response.json()),
+  triggerHop: () => fetch(`${API_BASE}/hop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  }).then((response) => response.json()),
+  armFault: (service: string, delayMs: number, requestCount = 1) => fetch(`${API_BASE}/api/fault`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ service, delay_ms: delayMs, request_count: requestCount }),
+  }).then(async (response) => {
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || "Unable to arm live fault");
+    return body;
+  }),
 };
 
-/* ==== Navbar Component ==== */
-const Navbar: React.FC = () => {
-  return (
-    <nav className="navbar">
-      <Link to="/" className="brand">
-        <div className="brand-icon">TQ</div>
-        <div>
-          <div className="brand-title">TimeQuake</div>
-          <div className="brand-subtitle">Causal Time-Travel Debugger</div>
-        </div>
-      </Link>
-      <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
-        <Link to="/" className="btn btn-sm">Dashboard</Link>
-        <a href="https://github.com" target="_blank" rel="noreferrer" className="btn btn-sm">Docs</a>
-      </div>
-    </nav>
-  );
-};
-
-/* ==== Anomaly Time-Series Chart ==== */
 type AnomalyPoint = {
   trace_id: string;
+  span_id: string;
   timestamp: number;
   service: string;
   z_score: number;
@@ -53,339 +43,359 @@ type AnomalyPoint = {
   is_anomalous: boolean;
 };
 
-const AnomalyChart: React.FC<{ points: AnomalyPoint[] }> = ({ points }) => {
-  const navigate = useNavigate();
+const Navbar: React.FC = () => (
+  <nav className="navbar">
+    <Link to="/" className="brand">
+      <div className="brand-icon">TQ</div>
+      <div>
+        <div className="brand-title">TimeQuake</div>
+        <div className="brand-subtitle">Causal Time-Travel Debugger</div>
+      </div>
+    </Link>
+    <Link to="/" className="btn btn-sm">Live dashboard</Link>
+  </nav>
+);
 
-  const width = 800;
-  const height = 180;
-  const padding = 30;
+const METRIC_LABELS: Record<string, string> = { over_max_count: "Over-Max count", delta_of_maximum: "Delta-of-Maximum", over_average_count: "Over-Average count", max_moving_average: "Max-moving-average" };
 
-  const maxZ = useMemo(() => {
-    const vals = points.map((p) => p.z_score);
-    return Math.max(5.0, ...vals);
-  }, [points]);
+const ServiceSidebar: React.FC<{ services: string[]; health: Record<string, any>; selected: string; onSelect: (service: string) => void }> = ({ services, health, selected, onSelect }) => (
+  <aside className="service-sidebar"><div className="sidebar-title">Services</div>{services.map((service) => {
+    const state = health[service]?.monitor_state || "normal";
+    return <button key={service} className={`service-tab ${selected === service ? "selected" : ""}`} onClick={() => onSelect(service)}><i className={`status-dot ${state}`} /><span>{service}</span><small>{state.replace("_", " ")}</small></button>;
+  })}</aside>
+);
 
-  const thresholdY = height - padding - ((2.0 / maxZ) * (height - 2 * padding));
+const CombinedMetricChart: React.FC<{ service: string; points: AnomalyPoint[]; events: any[]; rollbacks: any[] }> = ({ service, points, events, rollbacks }) => {
+  const [zoom, setZoom] = useState(100);
+  const visible = useMemo(() => points.slice(-Math.max(12, Math.ceil(points.length * zoom / 100))), [points, zoom]);
+  const width = Math.max(760, visible.length * 42);
+  const height = 250; const pad = { top: 24, right: 24, bottom: 30, left: 34 };
+  const values = visible.map((point) => point.z_score); const min = Math.min(-1, ...values) - .25; const max = Math.max(3, ...values) + .25; const range = Math.max(max - min, 1);
+  const y = (value: number) => height - pad.bottom - ((value - min) / range) * (height - pad.top - pad.bottom);
+  const x = (index: number) => pad.left + (visible.length <= 1 ? (width - pad.left - pad.right) / 2 : index * (width - pad.left - pad.right) / (visible.length - 1));
+  const currentIndex = Math.max(0, visible.length - Math.min(8, visible.length));
+  return <section className="card combined-chart-panel"><div className="chart-toolbar"><div><div className="card-title">{service} · combined signal timeline</div><span className="chart-subtitle">Line: current z-score · whiskers: per-bucket min / max · tick: average</span></div><label className="zoom-control">Zoom <input type="range" min="25" max="100" step="25" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /> {zoom}%</label></div>
+    {!visible.length ? <div className="empty-chart">Awaiting completed service spans</div> : <div className="combined-chart-scroll"><svg viewBox={`0 0 ${width} ${height}`} className="combined-chart" aria-label={`${service} live combined metrics chart`}>
+      {[0, .5, 1].map((fraction) => <line key={fraction} x1={pad.left} y1={pad.top + fraction * (height - pad.top - pad.bottom)} x2={width - pad.right} y2={pad.top + fraction * (height - pad.top - pad.bottom)} className="chart-grid" />)}
+      {visible.map((point, index) => point.is_anomalous && <rect key={`a-${point.span_id}`} x={x(index) - 13} y={pad.top} width="26" height={height - pad.top - pad.bottom} className="anomaly-region" />)}
+      <line x1={x(currentIndex)} y1={pad.top} x2={x(currentIndex)} y2={height - pad.bottom} className="current-divider" /><text x={x(currentIndex) + 5} y={pad.top + 10} className="current-label">CURRENT</text><text x={pad.left} y={pad.top + 10} className="past-label">PAST</text>
+      {visible.map((point, index) => { const bucket = visible.slice(Math.max(0, index - 1), Math.min(visible.length, index + 2)).map((entry) => entry.z_score); const low = Math.min(...bucket); const high = Math.max(...bucket); const avg = bucket.reduce((sum, value) => sum + value, 0) / bucket.length; return <g key={point.span_id}><line x1={x(index)} y1={y(low)} x2={x(index)} y2={y(high)} className="ohlc-whisker" /><line x1={x(index) - 6} y1={y(avg)} x2={x(index) + 6} y2={y(avg)} className="ohlc-average" /></g>; })}
+      {visible.length > 1 && <polyline points={visible.map((point, index) => `${x(index)},${y(point.z_score)}`).join(" ")} className="combined-line" />}
+      {visible.map((point, index) => <circle key={`p-${point.span_id}`} cx={x(index)} cy={y(point.z_score)} r={point.is_anomalous ? 4.5 : 2.8} className={point.is_anomalous ? "combined-dot anomaly" : "combined-dot"}><title>{`${new Date(point.timestamp * 1000).toLocaleTimeString()} · z ${point.z_score.toFixed(2)}`}</title></circle>)}
+      {rollbacks.filter((rollback) => rollback.service === service).map((rollback) => { const nearest = visible.reduce((best, point, index) => Math.abs(point.timestamp - rollback.timestamp) < Math.abs(visible[best].timestamp - rollback.timestamp) ? index : best, 0); return <g key={rollback.id}><line x1={x(nearest)} y1={pad.top} x2={x(nearest)} y2={height - pad.bottom} className="rollback-marker" /><text x={x(nearest) + 4} y={height - 12} className="rollback-label">Rolled back at {new Date(rollback.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</text></g>; })}
+    </svg></div>}
+    <div className="chart-footer"><span>{visible.length} samples</span><span>{events.filter((event) => event.status === "anomaly").length} automatic signals</span><span>scroll timeline to inspect historical buckets</span></div></section>;
+};
 
-  const coords = useMemo(() => {
-    if (!points.length) return [];
-    const minT = points[0].timestamp;
-    const maxT = points[points.length - 1].timestamp || minT + 1;
-    const tSpan = Math.max(maxT - minT, 1);
+const CausalGraph: React.FC<{ nodes: any[]; edges: any[]; currentStep?: number; live?: boolean; liveStates?: Record<string, any> }> = ({ nodes, edges, currentStep, live = false, liveStates = {} }) => {
+  const width = Math.max(760, nodes.length * 118 + 100);
+  const activeStep = currentStep ?? Math.max(nodes.length - 1, 0);
+  const positions = new Map(nodes.map((node, index) => [node.span_id, 58 + index * 118]));
 
-    return points.map((p) => {
-      const x = padding + ((p.timestamp - minT) / tSpan) * (width - 2 * padding);
-      const y = height - padding - ((p.z_score / maxZ) * (height - 2 * padding));
-      return { ...p, x, y };
-    });
-  }, [points, maxZ]);
+  if (!nodes.length) return <div className="empty-graph">Waiting for the first completed request…</div>;
 
   return (
-    <div className="card" style={{ marginBottom: "24px" }}>
-      <div className="card-title">
-        <span>Z-Score Anomaly Time-Series (Threshold z &gt; 2.0)</span>
-        <span style={{ fontSize: "11px", color: "var(--accent-amber)" }}>
-          {points.filter((p) => p.is_anomalous).length} Anomalous Request(s)
-        </span>
-      </div>
+    <div className="graph-container">
+      <svg width="100%" height="100%" viewBox={`0 0 ${width} 280`}>
+        {edges.map((edge: any) => {
+          const from = positions.get(edge.from);
+          const to = positions.get(edge.to);
+          const isPast = (nodes.findIndex((node) => node.span_id === edge.to) <= activeStep);
+          if (from === undefined || to === undefined) return null;
+          return <line key={`${edge.from}-${edge.to}`} x1={from} y1={132} x2={to} y2={132} className={isPast ? "graph-edge active" : "graph-edge"} />;
+        })}
+        {nodes.map((node: any, index: number) => {
+          const x = positions.get(node.span_id) || 0;
+          const isActive = index === activeStep;
+          const isPast = index <= activeStep;
+          const rollbackStatus = node.rollback_status;
+          const liveState = liveStates[node.service]?.transaction_state || node.current_state || {};
+          let nodeClass = "graph-node";
+          if (node.is_root_cause) nodeClass += " root-cause";
+          else if (node.is_symptom) nodeClass += " symptom";
+          else if (node.is_anomalous) nodeClass += " anomalous";
+          else if (isPast) nodeClass += " traversed";
+          if (liveState.status === "degraded") nodeClass += " degraded";
 
-      <div style={{ position: "relative", width: "100%", overflowX: "auto" }}>
-        <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: "180px" }}>
-          {/* Background grid */}
-          <line x1={padding} y1={padding} x2={width - padding} y2={padding} stroke="var(--border-color)" strokeDasharray="3 3" />
-          <line x1={padding} y1={height / 2} x2={width - padding} y2={height / 2} stroke="var(--border-color)" strokeDasharray="3 3" />
-
-          {/* Threshold Line z = 2.0 */}
-          <line
-            x1={padding}
-            y1={thresholdY}
-            x2={width - padding}
-            y2={thresholdY}
-            stroke="var(--accent-amber)"
-            strokeWidth="1.5"
-            strokeDasharray="4 4"
-          />
-          <text x={width - padding - 80} y={thresholdY - 6} fill="var(--accent-amber)" fontSize="10" className="mono">
-            Threshold (z = 2.0)
-          </text>
-
-          {/* Connective Line */}
-          {coords.length > 1 && (
-            <polyline
-              fill="none"
-              stroke="var(--accent-blue)"
-              strokeWidth="1.5"
-              opacity="0.6"
-              points={coords.map((c) => `${c.x},${c.y}`).join(" ")}
-            />
-          )}
-
-          {/* Data Points */}
-          {coords.map((c, i) => (
-            <g
-              key={i}
-              style={{ cursor: "pointer" }}
-              onClick={() => navigate(`/trace/${c.trace_id}`)}
-            >
-              <circle
-                cx={c.x}
-                cy={c.y}
-                r={c.is_anomalous ? 7 : 4}
-                fill={c.is_anomalous ? "var(--accent-rose)" : "var(--accent-cyan)"}
-                stroke={c.is_anomalous ? "#fff" : "none"}
-                strokeWidth={1.5}
-              />
-              <title>{`Trace: ${c.trace_id}\nService: ${c.service}\nZ-Score: ${c.z_score}\nFault Run: ${c.is_fault_run}`}</title>
+          return (
+            <g key={node.span_id} transform={`translate(${x}, 132)`}>
+              {rollbackStatus && <circle r={isActive ? 28 : 23} className={`rollback-ring ${rollbackStatus}`} />}
+              <circle r={isActive ? 20 : 16} className={nodeClass} />
+              {rollbackStatus && <text y={5} textAnchor="middle" className="rollback-mark">↶</text>}
+              <text y={isActive ? 38 : 33} textAnchor="middle" className="graph-service-label">{node.service}</text>
+              <text y={isActive ? 51 : 45} textAnchor="middle" className="graph-metric-label">z={node.z_score?.toFixed(2)}</text>
+              {live && <text y={isActive ? 63 : 57} textAnchor="middle" className="graph-state-label">{liveState.status || node.state_transition || "idle"}</text>}
+              {rollbackStatus && <text y={isActive ? -35 : -30} textAnchor="middle" className={`graph-rollback-label ${rollbackStatus}`}>{rollbackStatus}</text>}
             </g>
-          ))}
-        </svg>
-      </div>
+          );
+        })}
+      </svg>
+      {live && <div className="graph-live-note"><i /> Polling server state</div>}
     </div>
   );
 };
 
-/* ==== Microservices Status Panel ==== */
 const MicroservicesPanel: React.FC<{
   services: string[];
-  health: Record<string, any>;
-  onTriggerFault: (svc: string) => void;
-  loadingFault: boolean;
-}> = ({ services, health, onTriggerFault, loadingFault }) => {
-  const [selectedFaultSvc, setSelectedFaultSvc] = useState<string>("inventory");
+  onNormalRequest: () => void;
+  onLiveFault: (service: string, delayMs: number, requestCount: number, dispatchNow: boolean) => void;
+  action: string | null;
+}> = ({ services, onNormalRequest, onLiveFault, action }) => {
+  const [selectedService, setSelectedService] = useState("");
+  const [delayMs, setDelayMs] = useState(1500);
+  const [requestCount, setRequestCount] = useState(1);
+  const [dispatchNow, setDispatchNow] = useState(true);
+
+  useEffect(() => {
+    if (!selectedService || !services.includes(selectedService)) setSelectedService(services[0] || "");
+  }, [services, selectedService]);
 
   return (
-    <div className="card">
-      <div className="card-title">
-        <span>Live Microservices Chain (10 Hops)</span>
-        <div className="badge badge-up">Auto-refresh (4s)</div>
-      </div>
-
-      <div className="svc-grid" style={{ marginBottom: "20px" }}>
-        {services.map((name, idx) => {
-          const info = health[name] || {};
-          const isUp = info.status === "up";
-          const port = 5001 + idx;
-
-          return (
-            <div key={name} className="svc-card">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-                <span className="svc-name">#{idx + 1} {name}</span>
-                <span className={`badge ${isUp ? "badge-up" : "badge-down"}`}>
-                  {isUp ? "UP" : "DOWN"}
-                </span>
-              </div>
-              <div className="svc-meta mono">
-                Port: {port}<br />
-                Reqs: {info.request_count || 0}<br />
-                Uptime: {info.uptime || 0}s
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Demo Fault Injection Controller */}
-      <div style={{ background: "var(--bg-subtle)", padding: "16px", borderRadius: "10px", border: "1px solid var(--border-color)" }}>
-        <div style={{ fontSize: "13px", fontWeight: "600", marginBottom: "10px", color: "var(--accent-amber)" }}>
-          Simulate Fault Injection Demo
+    <section className="card panel-spaced">
+      <div className="fault-controller">
+        <div>
+          <div className="fault-controller-title">Live fault trigger</div>
+          <p>Choose the latency spike and how many real requests it affects. Arm it for natural traffic, or dispatch a request immediately—nothing is configured at startup.</p>
         </div>
-        <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
-          <select
-            className="btn btn-sm mono"
-            value={selectedFaultSvc}
-            onChange={(e) => setSelectedFaultSvc(e.target.value)}
-            style={{ padding: "8px 12px", background: "var(--bg-card)" }}
-          >
-            {services.map((s) => (
-              <option key={s} value={s}>
-                Inject Fault into '{s}'
-              </option>
-            ))}
+        <div className="fault-controls">
+          <select className="control-field mono" value={selectedService} onChange={(event) => setSelectedService(event.target.value)}>
+            {services.map((service) => <option key={service} value={service}>{service}</option>)}
           </select>
-
-          <button
-            className="btn btn-rose btn-sm"
-            disabled={loadingFault}
-            onClick={() => onTriggerFault(selectedFaultSvc)}
-          >
-            {loadingFault ? "Running Request..." : "Execute Fault Run (X-Fault-Run: true)"}
+          <input className="control-field mono delay-field" type="number" min="1" max="60000" value={delayMs} onChange={(event) => setDelayMs(Number(event.target.value))} aria-label="Fault delay in milliseconds" />
+          <span className="field-suffix">ms delay</span>
+          <input className="control-field mono count-field" type="number" min="1" max="25" value={requestCount} onChange={(event) => setRequestCount(Number(event.target.value))} aria-label="Requests to affect" />
+          <span className="field-suffix">request(s)</span>
+          <label className="dispatch-toggle"><input type="checkbox" checked={dispatchNow} onChange={(event) => setDispatchNow(event.target.checked)} /> send now</label>
+          <button className="btn btn-rose btn-sm" disabled={!selectedService || Boolean(action)} onClick={() => onLiveFault(selectedService, delayMs, requestCount, dispatchNow)}>
+            {action === "fault" ? "Arming…" : dispatchNow ? "Arm & send" : "Arm fault"}
+          </button>
+          <button className="btn btn-cyan btn-sm" disabled={Boolean(action)} onClick={onNormalRequest}>
+            {action === "normal" ? "Sending…" : "Send normal request"}
           </button>
         </div>
       </div>
-    </div>
+    </section>
   );
 };
 
-/* ==== Recent Incidents Feed ==== */
-const IncidentFeed: React.FC<{ incidents: any[] }> = ({ incidents }) => {
-  return (
-    <div className="card">
-      <div className="card-title">Recent Incidents Feed</div>
-      <div style={{ display: "flex", flexDirection: "column", gap: "12px", maxHeight: "360px", overflowY: "auto" }}>
-        {incidents.length === 0 ? (
-          <div style={{ color: "var(--text-muted)", fontSize: "13px" }}>No anomalies recorded yet. Run a fault test!</div>
-        ) : (
-          incidents.map((inc, i) => (
-            <Link
-              key={i}
-              to={`/trace/${inc.trace_id}`}
-              style={{
-                textDecoration: "none",
-                background: "var(--bg-subtle)",
-                border: "1px solid var(--border-color)",
-                borderRadius: "8px",
-                padding: "12px",
-                display: "block",
-                transition: "all 0.2s",
-              }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
-                <span className="mono" style={{ fontSize: "12px", color: "var(--accent-cyan)", fontWeight: "600" }}>
-                  {inc.trace_id}
-                </span>
-                <span className="badge badge-root">Root: {inc.service}</span>
-              </div>
-              <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "4px" }}>
-                Observed at symptom: <strong>{inc.symptom_service || "N/A"}</strong>
-              </div>
-              <div style={{ fontSize: "11px", color: "var(--text-dim)" }}>
-                {new Date((inc.timestamp || 0) * 1000).toLocaleTimeString()}
-              </div>
-            </Link>
-          ))
-        )}
-      </div>
+const IncidentFeed: React.FC<{ incidents: any[] }> = ({ incidents }) => (
+  <aside className="card panel-spaced incident-card">
+    <div className="card-title">Recent incidents</div>
+    <div className="incident-list">
+      {incidents.length === 0 ? <div className="empty-state">No anomalous traces yet.</div> : incidents.map((incident) => (
+        <Link key={incident.trace_id} to={`/trace/${incident.trace_id}`} className="incident-item">
+          <div><span className="mono incident-id">{incident.trace_id}</span><span className="badge badge-root">{incident.service}</span></div>
+          <p>Symptom: {incident.symptom_service || "awaiting diagnosis"}</p>
+          <time>{new Date((incident.timestamp || 0) * 1000).toLocaleTimeString()}</time>
+        </Link>
+      ))}
     </div>
-  );
+  </aside>
+);
+
+const eventLabel = (eventType: string) => ({
+  state_applied: "State applied",
+  fault_detected: "Fault observed",
+  rollback_scheduled: "Rollback scheduled",
+  rollback_completed: "State restored",
+}[eventType] || eventType.replaceAll("_", " "));
+
+const StateSnapshot: React.FC<{ title: string; state: any; variant: "before" | "after" }> = ({ title, state, variant }) => (
+  <div className={`state-snapshot ${variant}`}>
+    <span>{title}</span>
+    <strong>{state?.status || "idle"}</strong>
+    <div className="mono"><b>{state?.operation_count ?? 0}</b> applied</div>
+    <div className="mono"><b>{state?.rollback_count ?? 0}</b> restored</div>
+  </div>
+);
+
+const RollbackPlayback: React.FC<{ events: any[] }> = ({ events }) => {
+  const [step, setStep] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const boundedStep = Math.min(step, Math.max(events.length - 1, 0));
+  const event = events[boundedStep];
+
+  useEffect(() => setStep((current) => Math.min(current, Math.max(events.length - 1, 0))), [events.length]);
+  useEffect(() => {
+    if (!playing || events.length < 2) return undefined;
+    const timer = window.setInterval(() => setStep((current) => {
+      if (current >= events.length - 1) { setPlaying(false); return events.length - 1; }
+      return current + 1;
+    }), 1000);
+    return () => window.clearInterval(timer);
+  }, [playing, events.length]);
+
+  if (!event) return null;
+  const restoration = event.event_type === "rollback_completed";
+  return <section className="card panel-spaced playback-card">
+    <div className="card-title"><span>Persisted state restoration playback</span><span className="live-label"><i /> Replays database snapshots</span></div>
+    <p className="playback-copy">Move through the real state events captured for this trace. A completed rollback visibly returns the affected service from its pre-compensation state to its restored state.</p>
+    <div className="playback-controls"><button className="btn btn-sm btn-cyan" onClick={() => setPlaying(!playing)}>{playing ? "Pause" : "Play state changes"}</button><button className="btn btn-sm" onClick={() => setStep(Math.max(0, boundedStep - 1))}>← Previous</button><button className="btn btn-sm" onClick={() => setStep(Math.min(events.length - 1, boundedStep + 1))}>Next →</button><input className="slider" type="range" min="0" max={Math.max(events.length - 1, 0)} value={boundedStep} onChange={(entry) => setStep(Number(entry.target.value))} /><span className="mono replay-position">{boundedStep + 1}/{events.length}</span></div>
+    <div className={`state-event-focus ${event.event_type}`}><div><span className="event-kicker">{event.service}</span><h3>{eventLabel(event.event_type)}</h3><p>{new Date(event.timestamp * 1000).toLocaleTimeString()} · span {event.span_id}</p></div><span className={`badge ${restoration ? "badge-up" : event.event_type === "rollback_scheduled" ? "badge-root" : "badge-symptom"}`}>{restoration ? "previous state restored" : eventLabel(event.event_type)}</span></div>
+    <div className="state-transition"><StateSnapshot title={restoration ? "Before rollback" : "Previous state"} state={event.previous_state} variant="before" /><div className={`state-arrow ${restoration ? "reverse" : ""}`}>{restoration ? "↶" : "→"}<small>{restoration ? "compensate" : "apply"}</small></div><StateSnapshot title={restoration ? "Restored state" : "Current state"} state={event.current_state} variant="after" /></div>
+    <div className="event-rail">{events.map((item, index) => <button key={item.id} className={`event-dot ${index === boundedStep ? "selected" : ""} ${item.event_type}`} onClick={() => setStep(index)} title={`${item.service}: ${eventLabel(item.event_type)}`}><span>{index + 1}</span></button>)}</div>
+  </section>;
 };
 
-/* ==== Dashboard View Component ==== */
+const TopStatusBar: React.FC<{ health: Record<string, any>; now: number }> = ({ health, now }) => {
+  const states = Object.values(health).reduce((counts: Record<string, number>, item: any) => { counts[item.monitor_state || "normal"] = (counts[item.monitor_state || "normal"] || 0) + 1; return counts; }, {});
+  return <div className="top-status-bar"><span><i className="status-dot normal" /> {states.normal || 0} normal</span><span><i className="status-dot anomaly" /> {states.anomaly || 0} anomalous</span><span><i className="status-dot rolling_back" /> {states.rolling_back || 0} rolling back</span><time className="mono">{new Date(now).toLocaleString()}</time></div>;
+};
+
+const ServiceConfigPanel: React.FC<{ service: string; config: any; onSave: (config: any) => void; saving: boolean }> = ({ service, config, onSave, saving }) => {
+  const [draft, setDraft] = useState(config);
+  useEffect(() => setDraft(config), [config, service]);
+  if (!draft) return null;
+  return <section className="card config-panel"><div className="card-title"><span>{service} · detection policy</span><span className="mono">SQLite persisted</span></div><div className="metric-config-list">{Object.entries(METRIC_LABELS).map(([metric, label]) => <div className="metric-config" key={metric}><label><input type="checkbox" checked={Boolean(draft.active_metrics?.[metric])} onChange={(event) => setDraft({ ...draft, active_metrics: { ...draft.active_metrics, [metric]: event.target.checked } })} /> {label}</label><input className="control-field mono" type="number" step="0.05" min="0" value={draft.thresholds?.[metric] ?? 1} onChange={(event) => setDraft({ ...draft, thresholds: { ...draft.thresholds, [metric]: Number(event.target.value) } })} /></div>)}</div><div className="config-bottom"><label>Coverage <input className="control-field mono" type="number" min="1" max="100" value={draft.coverage_percent} onChange={(event) => setDraft({ ...draft, coverage_percent: Number(event.target.value) })} />%</label><label className="dispatch-toggle"><input type="checkbox" checked={Boolean(draft.auto_rollback)} onChange={(event) => setDraft({ ...draft, auto_rollback: event.target.checked })} /> auto-rollback</label><button className="btn btn-cyan btn-sm" disabled={saving} onClick={() => onSave(draft)}>{saving ? "Saving…" : "Save policy"}</button></div></section>;
+};
+
 const DashboardView: React.FC = () => {
   const [chain, setChain] = useState<string[]>([]);
   const [health, setHealth] = useState<Record<string, any>>({});
   const [anomalies, setAnomalies] = useState<AnomalyPoint[]>([]);
   const [incidents, setIncidents] = useState<any[]>([]);
   const [traces, setTraces] = useState<any[]>([]);
-  const [loadingFault, setLoadingFault] = useState(false);
+  const [liveTrace, setLiveTrace] = useState<any>(null);
+  const [faults, setFaults] = useState<any[]>([]);
+  const [selectedService, setSelectedService] = useState("");
+  const [monitorEvents, setMonitorEvents] = useState<any[]>([]);
+  const [now, setNow] = useState(Date.now());
+  const [savingConfig, setSavingConfig] = useState(false);
+  const [action, setAction] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const dashboardRequestVersion = useRef(0);
+  const latestTraceRequestVersion = useRef(0);
 
-  const reloadData = () => {
-    api.getChain().then((d) => setChain(d.services || []));
-    api.getHealth().then((h) => setHealth(h));
-    api.getAnomalies().then((a) => setAnomalies(a.anomalies || []));
-    api.getIncidents().then((inc) => setIncidents(inc.incidents || []));
-    api.getTraces().then((t) => setTraces(t.traces || []));
-  };
+  const refreshLatestTrace = useCallback(async () => {
+    const requestVersion = ++latestTraceRequestVersion.current;
+    try {
+      const traceData = await api.getTraces();
+      if (requestVersion !== latestTraceRequestVersion.current) return;
+      setTraces(traceData.traces || []);
+      const newestTrace = traceData.traces?.[0];
+      if (newestTrace?.trace_id) {
+        const newestTraceDetail = await api.getTrace(newestTrace.trace_id);
+        if (requestVersion !== latestTraceRequestVersion.current) return;
+        setLiveTrace(newestTraceDetail);
+      } else {
+        setLiveTrace(null);
+      }
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Unable to reach the latest trace");
+    }
+  }, []);
+
+  const reloadData = useCallback(async () => {
+    const requestVersion = ++dashboardRequestVersion.current;
+    try {
+      const [chainData, healthData, anomalyData, incidentData, faultData] = await Promise.all([
+        api.getChain(), api.getHealth(), api.getAnomalies(), api.getIncidents(), api.getFaults(),
+      ]);
+      if (requestVersion !== dashboardRequestVersion.current) return;
+      const configuredServices = chainData.services || [];
+      setChain(configuredServices);
+      setHealth(healthData || {});
+      setAnomalies(anomalyData.anomalies || []);
+      setIncidents(incidentData.incidents || []);
+      setFaults(faultData.faults || []);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Unable to reach the live server");
+    }
+  }, []);
+
+  const refreshLiveState = useCallback(async () => {
+    try {
+      const [healthData, faultData] = await Promise.all([api.getHealth(), api.getFaults()]);
+      setHealth(healthData || {});
+      setFaults(faultData.faults || []);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Unable to reach the live server");
+    }
+  }, []);
 
   useEffect(() => {
     reloadData();
-    const interval = setInterval(() => {
-      api.getHealth().then((h) => setHealth(h));
-    }, 4000);
-    return () => clearInterval(interval);
-  }, []);
+    refreshLatestTrace();
+    const dashboardInterval = window.setInterval(reloadData, POLL_INTERVAL_MS);
+    const liveInterval = window.setInterval(refreshLiveState, LIVE_POLL_INTERVAL_MS);
+    const traceInterval = window.setInterval(refreshLatestTrace, LIVE_POLL_INTERVAL_MS);
+    return () => { window.clearInterval(dashboardInterval); window.clearInterval(liveInterval); window.clearInterval(traceInterval); };
+  }, [reloadData, refreshLatestTrace, refreshLiveState]);
 
-  const handleTriggerFault = async (svc: string) => {
-    setLoadingFault(true);
+  useEffect(() => { if (!selectedService && chain[0]) setSelectedService(chain[0]); }, [chain, selectedService]);
+  useEffect(() => {
+    if (!selectedService) return undefined;
+    const load = () => api.getMonitorEvents(selectedService).then((data) => setMonitorEvents(data.events || []) ).catch(() => undefined);
+    load(); const timer = window.setInterval(load, LIVE_POLL_INTERVAL_MS); return () => window.clearInterval(timer);
+  }, [selectedService]);
+  useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
+
+  const runNormalRequest = async () => {
+    setAction("normal");
+    setError("");
     try {
-      const res = await api.triggerHop(true, svc);
-      setTimeout(() => {
-        reloadData();
-        setLoadingFault(false);
-      }, 800);
-    } catch (e) {
-      console.error(e);
-      setLoadingFault(false);
+      await api.triggerHop();
+      await Promise.all([reloadData(), refreshLatestTrace()]);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Normal request failed");
+    } finally {
+      setAction(null);
     }
   };
 
-  const handleNormalRun = async () => {
-    setLoadingFault(true);
+  const injectLiveFault = async (service: string, delayMs: number, requestCount: number, dispatchNow: boolean) => {
+    setAction("fault");
+    setError("");
     try {
-      await api.triggerHop(false);
-      setTimeout(() => {
-        reloadData();
-        setLoadingFault(false);
-      }, 500);
-    } catch (e) {
-      console.error(e);
-      setLoadingFault(false);
+      await api.armFault(service, Math.min(60000, Math.max(1, delayMs || 1)), Math.min(25, Math.max(1, requestCount || 1)));
+      if (dispatchNow) await api.triggerHop();
+      await Promise.all([reloadData(), refreshLatestTrace()]);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Live fault injection failed");
+    } finally {
+      setAction(null);
     }
   };
+
+  const selectedConfig = health[selectedService]?.monitor_config;
+  const saveConfig = async (config: any) => { setSavingConfig(true); try { await api.saveMonitorConfig(selectedService, config); await reloadData(); } finally { setSavingConfig(false); } };
+  const setOverride = async (state: "auto" | "normal" | "error") => { await api.setOverride(selectedService, state); await reloadData(); };
 
   return (
-    <div className="container">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "24px" }}>
-        <div>
-          <h1 style={{ fontSize: "28px", fontWeight: "700" }}>System Dashboard</h1>
-          <p style={{ color: "var(--text-muted)", fontSize: "14px" }}>
-            Real-time causal graph monitoring & automated root-cause analysis
-          </p>
-        </div>
-        <div style={{ display: "flex", gap: "10px" }}>
-          <button className="btn btn-sm btn-cyan" onClick={handleNormalRun} disabled={loadingFault}>
-            Send Normal Request
-          </button>
-        </div>
+    <main className="container">
+      <div className="page-heading">
+        <div><p className="eyebrow">Live causal observability</p><h1>System dashboard</h1><p>Per-service anomaly detection, real request state, and persisted saga compensation.</p></div>
+        {error && <div className="error-banner">{error}</div>}
       </div>
-
-      <AnomalyChart points={anomalies} />
-
-      <div className="grid-main">
-        <div>
-          <MicroservicesPanel
-            services={chain}
-            health={health}
-            onTriggerFault={handleTriggerFault}
-            loadingFault={loadingFault}
-          />
-
-          {/* Recent Traces Table */}
-          <div className="card" style={{ marginTop: "24px" }}>
-            <div className="card-title">Recent Request Traces</div>
-            <div className="table-container">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Trace ID</th>
-                    <th>Initiator</th>
-                    <th>Spans</th>
-                    <th>Type</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {traces.map((t) => (
-                    <tr key={t.trace_id}>
-                      <td className="mono" style={{ color: "var(--accent-cyan)" }}>{t.trace_id}</td>
-                      <td>{t.service}</td>
-                      <td>{t.span_count} hops</td>
-                      <td>
-                        <span className={`badge ${t.is_fault_run ? "badge-down" : "badge-up"}`}>
-                          {t.is_fault_run ? "FAULT RUN" : "NORMAL"}
-                        </span>
-                      </td>
-                      <td>
-                        <Link to={`/trace/${t.trace_id}`} className="btn btn-sm">
-                          Replay &amp; RCA
-                        </Link>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+      <TopStatusBar health={health} now={now} />
+      <div className="dashboard-with-sidebar">
+        <ServiceSidebar services={chain} health={health} selected={selectedService} onSelect={setSelectedService} />
+        <div className="dashboard-content">
+          <div className="service-detail-heading"><div><span className="eyebrow">Selected service</span><h2>{selectedService || "Loading services…"}</h2></div><div className="override-controls"><span>Demo override</span><button className="btn btn-sm" onClick={() => setOverride("normal")}>Simulate normal</button><button className="btn btn-rose btn-sm" onClick={() => setOverride("error")}>Simulate error</button><button className="btn btn-sm" onClick={() => setOverride("auto")}>Auto</button></div></div>
+          <CombinedMetricChart service={selectedService} points={anomalies.filter((point) => point.service === selectedService)} events={monitorEvents} rollbacks={liveTrace?.rollbacks || []} />
+          <ServiceConfigPanel service={selectedService} config={selectedConfig} onSave={saveConfig} saving={savingConfig} />
+          <div className="grid-main">
+            <div>
+          <MicroservicesPanel services={chain} onNormalRequest={runNormalRequest} onLiveFault={injectLiveFault} action={action} />
+          <section className="card live-graph-card">
+            <div className="card-title"><span>Latest causal graph</span><span className="mono trace-caption">{liveTrace?.trace_id || "awaiting trace"}</span></div>
+            <CausalGraph nodes={liveTrace?.nodes || []} edges={liveTrace?.edges || []} live liveStates={health} />
+          </section>
+          <section className="card panel-spaced traces-card">
+            <div className="card-title">Recent request traces</div>
+            <div className="table-container"><table className="table"><thead><tr><th>Trace</th><th>Initiator</th><th>Spans</th><th>Type</th><th /></tr></thead><tbody>
+              {traces.map((trace) => <tr key={trace.trace_id}><td className="mono cyan-text">{trace.trace_id}</td><td>{trace.service}</td><td>{trace.span_count}</td><td><span className={`badge ${trace.is_fault_run ? "badge-down" : "badge-up"}`}>{trace.is_fault_run ? "fault observed" : "normal"}</span></td><td><Link to={`/trace/${trace.trace_id}`} className="btn btn-sm">Inspect</Link></td></tr>)}
+            </tbody></table></div>
+          </section>
             </div>
+            <IncidentFeed incidents={incidents} />
           </div>
         </div>
-
-        <div>
-          <IncidentFeed incidents={incidents} />
-        </div>
       </div>
-    </div>
+    </main>
   );
 };
 
-/* ==== Trace Detail & Replay View ==== */
 const TraceDetailView: React.FC = () => {
   const { traceId } = useParams<{ traceId: string }>();
   const [data, setData] = useState<any>(null);
@@ -394,282 +404,62 @@ const TraceDetailView: React.FC = () => {
   const [isPlaying, setIsPlaying] = useState(false);
 
   useEffect(() => {
-    if (!traceId) return;
-    setLoading(true);
-    api.getTrace(traceId).then((res) => {
-      setData(res);
+    if (!traceId) return undefined;
+    let mounted = true;
+    const loadTrace = async () => {
+      const result = await api.getTrace(traceId);
+      if (!mounted) return;
+      setData(result);
       setLoading(false);
-      setCurrentStep((res.nodes?.length || 1) - 1);
-    });
+      setCurrentStep((step) => {
+        const latestMaxStep = Math.max((result.nodes?.length || 1) - 1, 0);
+        if (isFirstPayload) {
+          isFirstPayload = false;
+          return latestMaxStep;
+        }
+        return Math.min(step, latestMaxStep);
+      });
+    };
+    let isFirstPayload = true;
+    loadTrace();
+    const interval = window.setInterval(loadTrace, LIVE_POLL_INTERVAL_MS);
+    return () => { mounted = false; window.clearInterval(interval); };
   }, [traceId]);
 
-  const maxSteps = (data?.nodes?.length || 1) - 1;
-
+  const nodes = data?.nodes || [];
+  const maxSteps = Math.max(nodes.length - 1, 0);
   useEffect(() => {
-    let timer: any;
-    if (isPlaying) {
-      timer = setInterval(() => {
-        setCurrentStep((prev) => {
-          if (prev >= maxSteps) {
-            setIsPlaying(false);
-            return maxSteps;
-          }
-          return prev + 1;
-        });
-      }, 1000);
-    }
-    return () => clearInterval(timer);
+    if (!isPlaying) return undefined;
+    const timer = window.setInterval(() => setCurrentStep((step) => {
+      if (step >= maxSteps) { setIsPlaying(false); return maxSteps; }
+      return step + 1;
+    }), 900);
+    return () => window.clearInterval(timer);
   }, [isPlaying, maxSteps]);
 
-  if (loading || !data) {
-    return (
-      <div className="container" style={{ marginTop: "40px" }}>
-        <div className="card">Loading causal graph for trace {traceId}...</div>
-      </div>
-    );
-  }
-
-  const { nodes = [], edges = [], root_cause_service, symptom_service, cascade_path = [], rollback_events = [], explanation } = data;
+  if (loading || !data) return <main className="container"><div className="card loading-card">Loading live causal graph…</div></main>;
+  const rollbacks = data.rollbacks || data.rollback_events || [];
 
   return (
-    <div className="container">
-      <div style={{ marginBottom: "20px" }}>
-        <Link to="/" className="btn btn-sm" style={{ marginBottom: "12px" }}>
-          &larr; Back to Dashboard
-        </Link>
-        <h1 style={{ fontSize: "24px", fontWeight: "700" }}>
-          Trace Replay &amp; RCA: <span className="mono" style={{ color: "var(--accent-cyan)" }}>{traceId}</span>
-        </h1>
-      </div>
-
-      {/* Root Cause Explanation Banner */}
-      <div
-        className="card"
-        style={{
-          borderLeft: `4px solid ${root_cause_service ? "var(--accent-amber)" : "var(--accent-emerald)"}`,
-          background: root_cause_service ? "rgba(245, 158, 11, 0.08)" : "rgba(16, 185, 129, 0.08)",
-          marginBottom: "24px",
-        }}
-      >
-        <div style={{ display: "flex", gap: "12px", alignItems: "center", marginBottom: "8px" }}>
-          {root_cause_service ? (
-            <span className="badge badge-root">ROOT CAUSE FLAGGED: {root_cause_service}</span>
-          ) : (
-            <span className="badge badge-up">HEALTHY TRACE</span>
-          )}
-          {symptom_service && <span className="badge badge-symptom">Symptom Observed: {symptom_service}</span>}
-        </div>
-        <p style={{ fontSize: "14px", lineHeight: "1.6", color: "var(--text-main)" }}>
-          {explanation}
-        </p>
-      </div>
-
-      {/* Interactive Time-Travel Replayer */}
-      <div className="card" style={{ marginBottom: "24px" }}>
-        <div className="card-title">Interactive Time-Travel Replayer</div>
-        <div className="scrubber-panel">
-          <button className="btn btn-sm btn-cyan" onClick={() => setIsPlaying(!isPlaying)}>
-            {isPlaying ? "Pause" : "Play Replay"}
-          </button>
-          <button className="btn btn-sm" onClick={() => setCurrentStep(Math.max(0, currentStep - 1))}>
-            Step &larr;
-          </button>
-          <button className="btn btn-sm" onClick={() => setCurrentStep(Math.min(maxSteps, currentStep + 1))}>
-            Step &rarr;
-          </button>
-          <input
-            type="range"
-            min="0"
-            max={maxSteps}
-            value={currentStep}
-            onChange={(e) => setCurrentStep(parseInt(e.target.value))}
-            className="slider"
-          />
-          <span className="mono" style={{ fontSize: "13px", color: "var(--accent-cyan)" }}>
-            Hop {currentStep + 1} / {maxSteps + 1} ({nodes[currentStep]?.service})
-          </span>
-        </div>
-
-        {/* Causal Graph SVG Visualization */}
-        <div className="graph-container">
-          <svg width="100%" height="100%" viewBox="0 0 1000 280">
-            {/* Draw Horizontal Chain Edges */}
-            {nodes.map((node: any, idx: number) => {
-              if (idx === 0) return null;
-              const x1 = 60 + (idx - 1) * 90;
-              const x2 = 60 + idx * 90;
-              const y = 140;
-              const isPastStep = idx <= currentStep;
-
-              return (
-                <line
-                  key={idx}
-                  x1={x1}
-                  y1={y}
-                  x2={x2}
-                  y2={y}
-                  stroke={isPastStep ? (node.is_cascade ? "var(--accent-amber)" : "var(--accent-cyan)") : "var(--border-color)"}
-                  strokeWidth={isPastStep ? 3 : 1.5}
-                  strokeDasharray={isPastStep ? "none" : "4 4"}
-                />
-              );
-            })}
-
-            {/* Draw Service Hop Nodes */}
-            {nodes.map((node: any, idx: number) => {
-              const x = 60 + idx * 90;
-              const y = 140;
-              const isActive = idx === currentStep;
-              const isPast = idx <= currentStep;
-
-              let fill = "var(--bg-card)";
-              let stroke = "var(--border-glow)";
-              if (node.is_root_cause) {
-                fill = "var(--accent-amber)";
-                stroke = "#fff";
-              } else if (node.is_symptom) {
-                fill = "var(--accent-rose)";
-                stroke = "#fff";
-              } else if (node.is_anomalous) {
-                fill = "var(--accent-blue)";
-                stroke = "var(--accent-cyan)";
-              } else if (isPast) {
-                fill = "var(--accent-cyan)";
-                stroke = "#fff";
-              }
-
-              return (
-                <g key={node.span_id} transform={`translate(${x}, ${y})`}>
-                  <circle
-                    r={isActive ? 22 : 16}
-                    fill={fill}
-                    stroke={stroke}
-                    strokeWidth={isActive ? 3 : 1.5}
-                    style={{ transition: "all 0.3s ease" }}
-                  />
-                  <text
-                    y={isActive ? 36 : 30}
-                    textAnchor="middle"
-                    fill="var(--text-main)"
-                    fontSize="11"
-                    fontWeight={isActive ? "700" : "500"}
-                  >
-                    {node.service}
-                  </text>
-                  <text y={isActive ? 48 : 42} textAnchor="middle" fill="var(--text-muted)" fontSize="9" className="mono">
-                    z={node.z_score?.toFixed(2)}
-                  </text>
-                </g>
-              );
-            })}
-          </svg>
-        </div>
-      </div>
-
-      {/* Rollback Compensating Events Panel */}
-      {rollback_events.length > 0 && (
-        <div className="card" style={{ marginBottom: "24px" }}>
-          <div className="card-title">
-            <span>Saga Compensating Rollback Events</span>
-            <span className="badge badge-root">{rollback_events.length} Action(s) Triggered</span>
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {rollback_events.map((rb: any, i: number) => (
-              <div
-                key={i}
-                style={{
-                  background: "rgba(245, 158, 11, 0.1)",
-                  border: "1px solid rgba(245, 158, 11, 0.3)",
-                  borderRadius: "8px",
-                  padding: "12px 16px",
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                }}
-              >
-                <div>
-                  <strong style={{ color: "var(--accent-amber)" }}>[ROLLBACK] Service: '{rb.service}'</strong>
-                  <div style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "2px" }}>
-                    {rb.reason}
-                  </div>
-                </div>
-                <span className="badge badge-root">Triggered by {rb.triggered_by_service}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Hop Table */}
-      <div className="card">
-        <div className="card-title">Hop Metrics Table (Self-Time Isolation &amp; Z-Scores)</div>
-        <div className="table-container">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Hop #</th>
-                <th>Service</th>
-                <th>Total Duration</th>
-                <th>Self Time</th>
-                <th>Baseline Mean</th>
-                <th>Baseline Stdev</th>
-                <th>Z-Score</th>
-                <th>Role / Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {nodes.map((node: any, idx: number) => {
-                let roleStr = "Normal";
-                let badgeCls = "badge-up";
-                if (node.is_root_cause) {
-                  roleStr = "ROOT CAUSE";
-                  badgeCls = "badge-root";
-                } else if (node.is_symptom) {
-                  roleStr = "SYMPTOM";
-                  badgeCls = "badge-symptom";
-                } else if (node.is_cascade) {
-                  roleStr = "CASCADE PATH";
-                  badgeCls = "badge-cascade";
-                }
-
-                return (
-                  <tr key={node.span_id} className={node.is_root_cause ? "highlight-rc" : ""}>
-                    <td className="mono">{idx + 1}</td>
-                    <td style={{ fontWeight: "600" }}>{node.service}</td>
-                    <td className="mono">{node.duration_ms}ms</td>
-                    <td className="mono" style={{ color: "var(--accent-cyan)", fontWeight: "600" }}>
-                      {node.self_time_ms}ms
-                    </td>
-                    <td className="mono">{node.baseline_mean}ms</td>
-                    <td className="mono">{node.baseline_stdev}ms</td>
-                    <td className="mono" style={{ fontWeight: "700", color: node.z_score > 2.0 ? "var(--accent-rose)" : "var(--accent-emerald)" }}>
-                      {node.z_score?.toFixed(2)}
-                    </td>
-                    <td>
-                      <span className={`badge ${badgeCls}`}>{roleStr}</span>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+    <main className="container trace-page">
+      <Link to="/" className="btn btn-sm back-link">← Back to dashboard</Link>
+      <div className="trace-heading"><div><p className="eyebrow">Live trace replay</p><h1 className="mono">{traceId}</h1></div><span className="live-label"><i /> Syncing persisted state</span></div>
+      <section className={`card diagnosis-banner ${data.root_cause_service ? "has-root" : "healthy"}`}>
+        <div className="diagnosis-badges"><span className={`badge ${data.root_cause_service ? "badge-root" : "badge-up"}`}>{data.root_cause_service ? `Root cause: ${data.root_cause_service}` : "healthy trace"}</span>{data.symptom_service && <span className="badge badge-symptom">Symptom: {data.symptom_service}</span>}</div>
+        <p>{data.explanation}</p>
+      </section>
+      <section className="card panel-spaced">
+        <div className="card-title"><span>Interactive time-travel replay</span><span className="live-label"><i /> Database-backed rollback markers</span></div>
+        <div className="scrubber-panel"><button className="btn btn-sm btn-cyan" onClick={() => setIsPlaying(!isPlaying)}>{isPlaying ? "Pause" : "Play"}</button><button className="btn btn-sm" onClick={() => setCurrentStep(Math.max(0, currentStep - 1))}>Step ←</button><button className="btn btn-sm" onClick={() => setCurrentStep(Math.min(maxSteps, currentStep + 1))}>Step →</button><input type="range" min="0" max={maxSteps} value={currentStep} onChange={(event) => setCurrentStep(Number(event.target.value))} className="slider" /><span className="mono replay-position">Hop {currentStep + 1}/{maxSteps + 1}</span></div>
+        <CausalGraph nodes={nodes} edges={data.edges || []} currentStep={currentStep} />
+      </section>
+      {(data.state_history || []).length > 0 && <RollbackPlayback events={data.state_history} />}
+      {rollbacks.length > 0 && <section className="card panel-spaced rollback-card"><div className="card-title"><span>Persisted saga rollbacks</span><span className="mono">{rollbacks.length} database rows</span></div><div className="rollback-list">{rollbacks.map((rollback: any) => <div key={rollback.id || rollback.span_id} className={`rollback-row ${rollback.status}`}><div><strong>↶ {rollback.service}</strong><p>{rollback.reason}</p></div><div><span className={`badge ${rollback.status === "completed" ? "badge-up" : "badge-root"}`}>{rollback.status}</span><small className="mono">by {rollback.triggered_by_service}</small></div></div>)}</div></section>}
+      <section className="card panel-spaced"><div className="card-title">Hop metrics · self-time isolation</div><div className="table-container"><table className="table"><thead><tr><th>#</th><th>Service</th><th>Total</th><th>Self time</th><th>Baseline</th><th>Stdev</th><th>Z</th><th>State</th></tr></thead><tbody>{nodes.map((node: any, index: number) => { const role = node.is_root_cause ? "root cause" : node.is_symptom ? "symptom" : node.is_cascade ? "cascade" : "normal"; return <tr key={node.span_id} className={node.is_root_cause ? "highlight-rc" : ""}><td className="mono">{index + 1}</td><td>{node.service}</td><td className="mono">{node.duration_ms}ms</td><td className="mono cyan-text">{node.self_time_ms}ms</td><td className="mono">{node.baseline_mean}ms</td><td className="mono">{node.baseline_stdev}ms</td><td className={`mono z-score ${node.z_score > 2 ? "high" : ""}`}>{node.z_score?.toFixed(2)}</td><td><span className={`badge ${node.rollback_status ? "badge-root" : node.is_root_cause ? "badge-root" : node.is_symptom ? "badge-symptom" : "badge-up"}`}>{node.rollback_status ? `rollback ${node.rollback_status}` : role}</span></td></tr>; })}</tbody></table></div></section>
+    </main>
   );
 };
 
-/* ==== Main App Component ==== */
-const App: React.FC = () => {
-  return (
-    <Router>
-      <Navbar />
-      <Routes>
-        <Route path="/" element={<DashboardView />} />
-        <Route path="/trace/:traceId" element={<TraceDetailView />} />
-      </Routes>
-    </Router>
-  );
-};
+const App: React.FC = () => <Router><Navbar /><Routes><Route path="/" element={<DashboardView />} /><Route path="/trace/:traceId" element={<TraceDetailView />} /></Routes></Router>;
 
 export default App;

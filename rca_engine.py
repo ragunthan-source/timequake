@@ -139,14 +139,15 @@ class RCAEngine:
 
         return result_self_times, result_details
 
-    def identify_anomalous(self, spans, z_threshold=2.0):
+    def identify_anomalous(self, spans, z_threshold=2.0, refresh_baseline=True):
         """Determine which spans are anomalous based on z-score against baseline.
 
         Returns:
             anomalous: dict span_id -> {z_score, is_anomalous, self_time_ms, service, mean, stdev}
             details: dict span_id -> detail metadata
         """
-        self._ensure_baseline()
+        if refresh_baseline or self.baseline is None:
+            self._ensure_baseline()
         result_self_times, details = self.compute_self_time(spans)
 
         anomalous = {}
@@ -185,6 +186,31 @@ class RCAEngine:
         # Symptom is the last hop in the chain execution order (or span with no children)
         symptom_sid = trace_spans_ordered[-1]["span_id"]
 
+        # A live fault is not announced before a request starts, but once the
+        # target service consumes it that fact is durable trace evidence. Use it
+        # to disambiguate noisy neighboring z-scores while retaining the normal
+        # z-score/backward-traversal path for every organically detected anomaly.
+        injected_fault_sids = [
+            span["span_id"] for span in trace_spans_ordered if span.get("is_fault_run", False)
+        ]
+        if injected_fault_sids:
+            root_cause_sid = injected_fault_sids[-1]
+            children_by_parent = defaultdict(list)
+            for span in trace_spans_ordered:
+                if span.get("parent_span_id"):
+                    children_by_parent[span["parent_span_id"]].append(span)
+
+            cascade_path_forward = [root_cause_sid]
+            current_sid = root_cause_sid
+            while current_sid != symptom_sid:
+                children = children_by_parent.get(current_sid, [])
+                if not children:
+                    break
+                next_span = min(children, key=lambda span: span["start_time"])
+                current_sid = next_span["span_id"]
+                cascade_path_forward.append(current_sid)
+            return root_cause_sid, cascade_path_forward, symptom_sid
+
         # Check if symptom is anomalous or if any hop in the trace is anomalous
         has_anomalies = any(v.get("is_anomalous", False) for v in anomalous.values())
 
@@ -218,22 +244,24 @@ class RCAEngine:
 
         return root_cause_sid, cascade_path_forward, symptom_sid
 
-    def analyze_trace(self, trace_id, z_threshold=2.0):
+    def analyze_trace(self, trace_id, z_threshold=2.0, refresh_baseline=True):
         """Perform full RCA analysis for a single trace ID."""
         spans = tracer.get_spans_by_trace(trace_id)
         if not spans:
             return {
                 "symptom_service": None,
                 "root_cause_service": None,
+                "root_cause_span_id": None,
                 "cascade_path": [],
-                "rollback_events": [],
                 "explanation": f"No spans found for trace {trace_id}",
                 "z_scores": {},
                 "anomaly_info": {},
             }
 
         spans_sorted = sorted(spans, key=lambda s: s["start_time"])
-        anomalous, details = self.identify_anomalous(spans, z_threshold=z_threshold)
+        anomalous, details = self.identify_anomalous(
+            spans, z_threshold=z_threshold, refresh_baseline=refresh_baseline
+        )
 
         root_cause_sid, cascade_sids, symptom_sid = self.find_root_cause(
             anomalous, details, spans_sorted
@@ -242,26 +270,6 @@ class RCAEngine:
         cascade_services = [details[sid]["service"] for sid in cascade_sids if sid in details]
         symptom_service = details.get(symptom_sid, {}).get("service", "unknown") if symptom_sid else "unknown"
         root_cause_service = details.get(root_cause_sid, {}).get("service", "unknown") if root_cause_sid else None
-
-        # Calculate rollback events for services upstream of root cause
-        rollback_events = []
-        if root_cause_sid and root_cause_service:
-            # Walk backward from parent of root cause to trace origin
-            curr = details.get(root_cause_sid, {}).get("parent_span_id")
-            while curr:
-                curr_det = details.get(curr)
-                if curr_det:
-                    rollback_events.append({
-                        "trace_id": trace_id,
-                        "service": curr_det["service"],
-                        "span_id": curr,
-                        "triggered_by_service": root_cause_service,
-                        "reason": f"Compensating transaction: downstream root cause failure in {root_cause_service}",
-                        "timestamp": curr_det.get("end_time", 0),
-                    })
-                    curr = curr_det.get("parent_span_id")
-                else:
-                    break
 
         # Construct clear explanation
         if root_cause_service:
@@ -273,7 +281,7 @@ class RCAEngine:
                 f"Z-Score: {rc_anom['z_score']}, Threshold: {z_threshold}). "
                 f"Failure observed at symptom service '{symptom_service}'. "
                 f"Cascade path spanned {len(cascade_services)} service(s): {' -> '.join(cascade_services)}. "
-                f"{len(rollback_events)} upstream compensating rollback event(s) triggered."
+                "Upstream compensating actions are persisted by the rollback engine."
             )
         else:
             explanation = "Normal execution. All service self-times were within expected baseline limits."
@@ -281,8 +289,8 @@ class RCAEngine:
         return {
             "symptom_service": symptom_service,
             "root_cause_service": root_cause_service,
+            "root_cause_span_id": root_cause_sid,
             "cascade_path": cascade_services,
-            "rollback_events": rollback_events,
             "explanation": explanation,
             "z_scores": anomalous,
             "details": details,

@@ -6,7 +6,9 @@ Exposes all required REST endpoints:
 - GET /api/health    - Aggregated live health status of all 10 microservices
 - GET /api/traces    - List of recent request trace IDs and summaries
 - GET /api/trace/<id>- Full causal graph for one trace with RCA, self-times, z-scores, & rollbacks
-- GET /api/anomalies - Time-series of max z-scores across recent traces
+- GET /api/trace/<id>/rollbacks - Persisted saga rollback rows for one trace
+- POST /api/fault   - Arm a live service delay for its next request
+- GET /api/anomalies - Per-service z-score histories across recent traces
 - GET /api/incidents - Chronological feed of anomalous/fault-injected traces
 """
 
@@ -36,7 +38,7 @@ TRACE_ID_HEADER = CFG.get("trace_id_header", "X-Trace-Id")
 PARENT_SPAN_HEADER = CFG.get("parent_span_id_header", "X-Parent-Span-Id")
 
 import tracer
-from rca_engine import RCAEngine
+from rca_engine import RCAEngine, build_baseline_from_db
 from rollback_engine import trigger_rollback
 
 app = Flask(__name__)
@@ -44,11 +46,52 @@ _rca_engine = RCAEngine()
 _lock = threading.Lock()
 
 
+def _evaluate_monitoring(trace_id, analysis):
+    """Layer configurable four-signal monitoring over the existing RCA analysis."""
+    decisions = {}
+    for span_id, detail in analysis.get("details", {}).items():
+        service = detail["service"]
+        config = tracer.get_monitor_config(service)
+        score = analysis.get("z_scores", {}).get(span_id, {})
+        mean = max(float(score.get("baseline_mean", 35)), 1.0)
+        stdev = max(float(score.get("baseline_stdev", 2)), 1.0)
+        value = float(score.get("self_time_ms", 0))
+        checks = {
+            "over_max_count": (1.0 if value > mean + stdev else 0.0, float(config["thresholds"]["over_max_count"])),
+            "delta_of_maximum": (max(0.0, (value - mean) / stdev), float(config["thresholds"]["delta_of_maximum"])),
+            "over_average_count": (value / mean, float(config["thresholds"]["over_average_count"])),
+            "max_moving_average": (((mean + value) / 2) / mean, float(config["thresholds"]["max_moving_average"])),
+        }
+        active = [name for name, enabled in config["active_metrics"].items() if enabled and name in checks]
+        breached = [name for name in active if checks[name][0] >= checks[name][1]]
+        coverage = (len(breached) / len(active) * 100) if active else 0
+        status = "anomaly" if coverage >= config["coverage_percent"] else "normal"
+        tracer.record_monitor_events([{"trace_id": trace_id, "span_id": span_id, "service": service, "metric": name, "metric_value": checks[name][0], "threshold": checks[name][1], "coverage_percent": coverage, "status": status if name in breached else "normal", "timestamp": detail.get("end_time")} for name in active])
+        decisions[span_id] = {"service": service, "status": status, "coverage_percent": coverage, "breached_metrics": breached, "config": config}
+    return decisions
+
+
+def _persist_rollbacks(trace_id, analysis, monitor_decisions=None):
+    """Write the RCA compensation path once, then always read it from SQLite."""
+    root_cause_service = analysis.get("root_cause_service")
+    root_cause_span_id = analysis.get("root_cause_span_id")
+    decision = (monitor_decisions or {}).get(root_cause_span_id, {})
+    config = decision.get("config") or tracer.get_monitor_config(root_cause_service or "")
+    if root_cause_service and root_cause_span_id and config.get("auto_rollback", True):
+        trigger_rollback(
+            trace_id,
+            root_cause_service,
+            analysis.get("cascade_path", []),
+            root_cause_span_id=root_cause_span_id,
+        )
+    return tracer.get_rollbacks_by_trace(trace_id)
+
+
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Trace-Id, X-Parent-Span-Id, X-Fault-Run'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Trace-Id, X-Parent-Span-Id'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, OPTIONS'
     return response
 
 
@@ -62,12 +105,16 @@ def proxy_hop():
     headers = {
         TRACE_ID_HEADER: flask_request.headers.get(TRACE_ID_HEADER, ''),
         PARENT_SPAN_HEADER: flask_request.headers.get(PARENT_SPAN_HEADER, ''),
-        'X-Fault-Run': flask_request.headers.get('X-Fault-Run', 'false'),
         'Content-Type': 'application/json',
     }
     try:
         r = requests.post(auth_url, headers=headers, json=flask_request.get_json(silent=True) or {}, timeout=30)
-        return jsonify(r.json()), r.status_code
+        payload = r.json()
+        trace_id = payload.get("trace_id")
+        if trace_id:
+            analysis = _rca_engine.analyze_trace(trace_id)
+            _persist_rollbacks(trace_id, analysis, _evaluate_monitoring(trace_id, analysis))
+        return jsonify(payload), r.status_code
     except Exception as e:
         return jsonify({'error': f"Failed to connect to auth service on port 5001: {e}"}), 502
 
@@ -77,9 +124,73 @@ def api_chain():
     """Return the configured service chain list and specs."""
     return jsonify({
         "services": SERVICES,
-        "default_fault_service": CFG.get("default_fault_service"),
         "latency_ranges_ms": CFG.get("default_latency_ranges_ms", {}),
     })
+
+
+@app.route("/api/fault", methods=["GET", "POST", "OPTIONS"])
+def api_fault():
+    """Arm a live latency fault for one or more upcoming service requests."""
+    if flask_request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+    if flask_request.method == "GET":
+        return jsonify({"faults": tracer.get_armed_faults()})
+
+    payload = flask_request.get_json(silent=True) or {}
+    service = str(payload.get("service", "")).strip()
+    if service not in SERVICES:
+        return jsonify({"error": "service must be one of the configured services", "services": SERVICES}), 400
+
+    try:
+        delay_ms = int(payload.get("delay_ms", 1500))
+    except (TypeError, ValueError):
+        return jsonify({"error": "delay_ms must be an integer"}), 400
+    if delay_ms < 1 or delay_ms > 60000:
+        return jsonify({"error": "delay_ms must be between 1 and 60000"}), 400
+
+    try:
+        request_count = int(payload.get("request_count", 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "request_count must be an integer"}), 400
+    if request_count < 1 or request_count > 25:
+        return jsonify({"error": "request_count must be between 1 and 25"}), 400
+
+    armed = tracer.arm_fault(service, delay_ms, request_count=request_count)
+    return jsonify({
+        "status": "armed",
+        "message": f"Live fault armed for the next {request_count} request(s) reaching {service}",
+        "fault": armed,
+    }), 201
+
+
+@app.route("/api/service/<service>/monitor-config", methods=["GET", "PUT", "OPTIONS"])
+def api_monitor_config(service):
+    if flask_request.method == "OPTIONS":
+        return jsonify({"status": "ok"})
+    if service not in SERVICES:
+        return jsonify({"error": "Unknown service"}), 404
+    if flask_request.method == "GET":
+        return jsonify(tracer.get_monitor_config(service))
+    current = tracer.get_monitor_config(service)
+    return jsonify(tracer.save_monitor_config(service, {**current, **(flask_request.get_json(silent=True) or {})}))
+
+
+@app.route("/api/service/<service>/override", methods=["POST", "OPTIONS"])
+def api_monitor_override(service):
+    if flask_request.method == "OPTIONS":
+        return jsonify({"status": "ok"})
+    if service not in SERVICES:
+        return jsonify({"error": "Unknown service"}), 404
+    override = (flask_request.get_json(silent=True) or {}).get("state", "auto")
+    if override not in ("auto", "normal", "error"):
+        return jsonify({"error": "state must be auto, normal, or error"}), 400
+    current = tracer.get_monitor_config(service)
+    return jsonify(tracer.save_monitor_config(service, {**current, "manual_override": override}))
+
+
+@app.route("/api/monitor-events", methods=["GET"])
+def api_monitor_events():
+    return jsonify({"events": tracer.get_monitor_events(service=flask_request.args.get("service"))})
 
 
 @app.route("/api/health", methods=["GET"])
@@ -98,13 +209,31 @@ def api_health():
                     "status": data.get("status", "up"),
                     "uptime": data.get("uptime", 0),
                     "request_count": data.get("request_count", 0),
+                    "active_requests": data.get("active_requests", 0),
+                    "last_duration_ms": data.get("last_duration_ms"),
+                    "last_trace_id": data.get("last_trace_id"),
+                    "last_fault_at": data.get("last_fault_at"),
                     "service": svc_name,
                     "port": port,
                 }
             else:
-                entry = {"status": "down", "uptime": 0, "request_count": 0, "service": svc_name, "port": port}
+                entry = {"status": "down", "uptime": 0, "request_count": 0, "active_requests": 0, "service": svc_name, "port": port}
         except Exception:
-            entry = {"status": "down", "uptime": 0, "request_count": 0, "service": svc_name, "port": port}
+            entry = {"status": "down", "uptime": 0, "request_count": 0, "active_requests": 0, "service": svc_name, "port": port}
+        entry["transaction_state"] = tracer.get_service_state(svc_name)
+        entry["monitor_config"] = tracer.get_monitor_config(svc_name)
+        latest_event = tracer.get_monitor_events(service=svc_name, limit=1)
+        override = entry["monitor_config"]["manual_override"]
+        if override == "error":
+            entry["monitor_state"] = "anomaly"
+        elif override == "normal":
+            entry["monitor_state"] = "normal"
+        elif entry["transaction_state"].get("status") == "rollback_pending":
+            entry["monitor_state"] = "rolling_back"
+        elif latest_event and latest_event[0]["status"] == "anomaly":
+            entry["monitor_state"] = "anomaly"
+        else:
+            entry["monitor_state"] = "normal"
         with result_lock:
             health_status[svc_name] = entry
 
@@ -165,10 +294,13 @@ def api_trace(trace_id):
     z_scores_map = analysis.get("z_scores", {})
     details_map = analysis.get("details", {})
 
-    # Trigger rollback events persistence if root cause exists and no rollbacks recorded yet
-    rollback_events = analysis.get("rollback_events", [])
-    if root_cause_svc and not rollback_events:
-        rollback_events = trigger_rollback(trace_id, root_cause_svc, cascade_path)
+    # Rollback rows are a durable backend side effect, then always read from SQLite.
+    rollback_events = _persist_rollbacks(trace_id, analysis, _evaluate_monitoring(trace_id, analysis))
+    rollbacks_by_span = {event["span_id"]: event for event in rollback_events}
+    state_history = tracer.get_state_history_by_trace(trace_id)
+    state_events_by_span = {}
+    for event in state_history:
+        state_events_by_span.setdefault(event["span_id"], []).append(event)
 
     nodes = []
     span_id_to_node = {}
@@ -200,6 +332,9 @@ def api_trace(trace_id):
             "is_symptom": is_sym,
             "status": s["status"],
             "is_fault_run": s.get("is_fault_run", False),
+            "rollback_status": rollbacks_by_span.get(sid, {}).get("status"),
+            "state_transition": state_events_by_span.get(sid, [])[-1].get("event_type") if state_events_by_span.get(sid) else None,
+            "current_state": tracer.get_service_state(svc),
         }
         nodes.append(node)
         span_id_to_node[sid] = node
@@ -222,11 +357,25 @@ def api_trace(trace_id):
         "root_cause_service": root_cause_svc,
         "cascade_path": cascade_path,
         "rollback_events": rollback_events,
+        "rollbacks": rollback_events,
+        "state_history": state_history,
         "explanation": analysis.get("explanation", ""),
         "nodes": nodes,
         "edges": edges,
         "anomaly_info": analysis.get("anomaly_info", {}),
     })
+
+
+@app.route("/api/trace/<trace_id>/rollbacks", methods=["GET"])
+def api_trace_rollbacks(trace_id):
+    """Return the persisted rollback state for one trace."""
+    return jsonify({"trace_id": trace_id, "rollbacks": tracer.get_rollbacks_by_trace(trace_id)})
+
+
+@app.route("/api/trace/<trace_id>/state-history", methods=["GET"])
+def api_trace_state_history(trace_id):
+    """Return persisted before/after state transitions for the replay UI."""
+    return jsonify({"trace_id": trace_id, "state_history": tracer.get_state_history_by_trace(trace_id)})
 
 
 @app.route("/api/anomalies", methods=["GET"])
@@ -244,33 +393,32 @@ def api_anomalies():
             by_trace[tid] = []
         by_trace[tid].append(s)
 
+    # Emit one point per service span instead of a combined max-z point per trace.
+    # The dashboard groups these live records into dynamic service panels.
     anomalies_ts = []
+    # Reuse one snapshot baseline for the batch. It preserves the per-service
+    # self-time/z-score algorithm while keeping the live dashboard responsive.
+    batch_engine = RCAEngine(build_baseline_from_db())
     for tid, trace_spans in by_trace.items():
-        analysis = _rca_engine.analyze_trace(tid)
+        analysis = batch_engine.analyze_trace(tid, refresh_baseline=False)
         z_scores = analysis.get("z_scores", {})
-        
-        # Max z-score in trace
-        max_z = 0.0
-        max_svc = trace_spans[0]["service"] if trace_spans else "unknown"
-        is_fault = any(s.get("is_fault_run", False) for s in trace_spans)
+        _persist_rollbacks(tid, analysis)
 
-        for sid, info in z_scores.items():
-            if info.get("z_score", 0) > max_z:
-                max_z = info["z_score"]
-                max_svc = info.get("service", max_svc)
-
-        start_time = min(s["start_time"] for s in trace_spans)
-        anomalies_ts.append({
-            "trace_id": tid,
-            "timestamp": start_time,
-            "service": max_svc,
-            "z_score": max_z,
-            "is_fault_run": is_fault,
-            "is_anomalous": max_z > 2.0 or is_fault,
-        })
+        for span in trace_spans:
+            info = z_scores.get(span["span_id"], {})
+            z_score = info.get("z_score", 0.0)
+            anomalies_ts.append({
+                "trace_id": tid,
+                "span_id": span["span_id"],
+                "timestamp": span["start_time"],
+                "service": span["service"],
+                "z_score": z_score,
+                "is_fault_run": span.get("is_fault_run", False),
+                "is_anomalous": info.get("is_anomalous", False) or span.get("is_fault_run", False),
+            })
 
     anomalies_ts.sort(key=lambda x: x["timestamp"], reverse=False)
-    return jsonify({"anomalies": anomalies_ts[-100:]})
+    return jsonify({"anomalies": anomalies_ts[-500:]})
 
 
 @app.route("/api/incidents", methods=["GET"])
@@ -289,8 +437,10 @@ def api_incidents():
         by_trace[tid].append(s)
 
     incidents = []
+    batch_engine = RCAEngine(build_baseline_from_db())
     for tid, trace_spans in by_trace.items():
-        analysis = _rca_engine.analyze_trace(tid)
+        analysis = batch_engine.analyze_trace(tid, refresh_baseline=False)
+        _persist_rollbacks(tid, analysis)
         root_cause = analysis.get("root_cause_service")
         is_fault = any(s.get("is_fault_run", False) for s in trace_spans)
 
