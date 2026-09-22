@@ -1,0 +1,150 @@
+version: '3.8'
+
+services:
+
+  # Backend API
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python api.py
+    ports:
+      - "5000:5000"
+    environment:
+      - SERVICE_NAME=api
+    depends_on:
+      - auth
+      - cart
+      - inventory
+      - pricing
+      - discount
+      - fraud_check
+      - payment
+      - shipping
+      - notification
+      - analytics
+    restart: unless-stopped
+
+  # Microservices chain
+  auth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py auth
+    environment:
+      - SERVICE_NAME=auth
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  cart:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py cart
+    environment:
+      - SERVICE_NAME=cart
+    ports:
+      - "5001:5001"
+    restart: unless-stopped
+
+  inventory:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py inventory
+    environment:
+      - SERVICE_NAME=inventory
+    ports:
+      - "5002:5002"
+    restart: unless-stopped
+
+  pricing:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py pricing
+    environment:
+      - SERVICE_NAME=pricing
+    ports:
+      - "5003:5003"
+    restart: unless-stopped
+
+  discount:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py discount
+    environment:
+      - SERVICE_NAME=discount
+    ports:
+      - "5004:5004"
+    restart: unless-stopped
+
+  fraud_check:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py fraud_check
+    environment:
+      - SERVICE_NAME=fraud_check
+    ports:
+      - "5005:5005"
+    restart: unless-stopped
+
+  payment:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py payment
+    environment:
+      - SERVICE_NAME=payment
+    ports:
+      - "5006:5006"
+    restart: unless-stopped
+
+  shipping:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py shipping
+    environment:
+      - SERVICE_NAME=shipping
+    ports:
+      - "5007:5007"
+    restart: unless-stopped
+
+  notification:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py notification
+    environment:
+      - SERVICE_NAME=notification
+    ports:
+      - "5008:5008"
+    restart: unless-stopped
+
+  analytics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python services/service_node.py analytics
+    environment:
+      - SERVICE_NAME=analytics
+    ports:
+      - "5009:5009"
+    restart: unless-stopped
+
+  # Frontend dashboard
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8080"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:5000/api
+    depends_on:
+      - api
+    restart: unless-stopped

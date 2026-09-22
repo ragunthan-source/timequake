@@ -1,0 +1,59 @@
+{
+  "services": [
+    "auth",
+    "cart",
+    "inventory",
+    "pricing",
+    "discount",
+    "fraud_check",
+    "payment",
+    "shipping",
+    "notification",
+    "analytics"
+  ],
+  "default_latency_ranges_ms": {
+    "auth": [
+      20,
+      50
+    ],
+    "cart": [
+      30,
+      60
+    ],
+    "inventory": [
+      40,
+      80
+    ],
+    "pricing": [
+      20,
+      40
+    ],
+    "discount": [
+      20,
+      40
+    ],
+    "fraud_check": [
+      50,
+      100
+    ],
+    "payment": [
+      60,
+      120
+    ],
+    "shipping": [
+      30,
+      50
+    ],
+    "notification": [
+      15,
+      30
+    ],
+    "analytics": [
+      20,
+      40
+    ]
+  },
+  "default_fault_service": "inventory",
+  "trace_id_header": "X-Trace-Id",
+  "parent_span_id_header": "X-Parent-Span-Id"
+}
