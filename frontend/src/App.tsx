@@ -439,6 +439,62 @@ const TraceDetailView: React.FC = () => {
 
   if (loading || !data) return <main className="container"><div className="card loading-card">Loading live causal graph…</div></main>;
   const rollbacks = data.rollbacks || data.rollback_events || [];
+  const rootError = data.root_cause_error;
+  const inventoryShortfall = typeof rootError?.message === "string"
+    ? rootError.message.match(/\bSKU\s+([\w.-]+)\s+is unavailable\b[\s\S]*?\bavailable\s*=\s*(\d+)\s*,\s*requested\s*=\s*(\d+)/i)
+    : null;
+  const errorInterpretation = rootError
+    ? inventoryShortfall
+      ? `Reservation for ${inventoryShortfall[1]} was rejected: ${inventoryShortfall[2]} unit(s) were available but ${inventoryShortfall[3]} were requested. The immediate cause is insufficient inventory for this request; if stock should have been available, investigate stale stock updates or concurrent reservations.`
+      : "The trace captured the exception type and message, but not a stack trace or nested cause. Correlate the span ID with this service's logs to identify the exact failing code path or dependency."
+    : null;
+  const rootNode = nodes.find((node: any) => node.span_id === rootError?.span_id) || nodes.find((node: any) => node.is_root_cause);
+  const symptomNode = nodes.find((node: any) => node.service === data.symptom_service && node.is_symptom)
+    || nodes.find((node: any) => node.service === data.symptom_service);
+  const cascadePath: string[] = Array.isArray(data.cascade_path) ? data.cascade_path : [];
+  const zThreshold = Number(data.anomaly_info?.z_threshold ?? 2);
+  const selfTime = Number(rootNode?.self_time_ms);
+  const baseline = Number(rootNode?.baseline_mean);
+  const zScore = Number(rootNode?.z_score);
+  const hasTimingEvidence = Number.isFinite(selfTime) && Number.isFinite(baseline);
+  const timingDelta = hasTimingEvidence ? selfTime - baseline : 0;
+  const rootIsAnomalous = Boolean(rootNode?.is_anomalous) || (Number.isFinite(zScore) && zScore > zThreshold);
+  const timingEvidence = rootNode && hasTimingEvidence
+    ? `Self time was ${selfTime}ms against a ${baseline}ms baseline (${timingDelta >= 0 ? "+" : ""}${timingDelta.toFixed(1)}ms); Z-score ${Number.isFinite(zScore) ? zScore.toFixed(2) : "unavailable"}${Number.isFinite(zScore) ? ` vs. ${zThreshold.toFixed(1)} threshold` : ""}.`
+    : "Per-span self-time and baseline measurements were not available.";
+  const timingExplanation = rootError
+    ? `${rootIsAnomalous ? "A concrete application error and an above-threshold timing anomaly were both captured on the selected root span." : `A concrete ${rootError.type} error is recorded on the selected root span. The timing measurements do not indicate a latency anomaly, so the fault attribution comes from the explicit error signal—not excess self-time.`} ${timingEvidence}`
+    : rootNode && hasTimingEvidence
+      ? `RCA selected ${rootNode.service} from timing evidence. ${timingEvidence} ${rootIsAnomalous ? "The span exceeds the anomaly threshold, which supports this service as the likely fault origin." : "The span is not above the latency threshold, so treat the attribution as unconfirmed and inspect logs before concluding."}`
+      : "The trace does not contain per-span timing measurements to explain the RCA selection.";
+  const rootCallPath: any[] = [];
+  const visitedSpanIds = new Set<string>();
+  let callCursor = rootNode;
+  while (callCursor && !visitedSpanIds.has(callCursor.span_id) && rootCallPath.length < 16) {
+    visitedSpanIds.add(callCursor.span_id);
+    rootCallPath.unshift(callCursor);
+    callCursor = nodes.find((node: any) => node.span_id === callCursor.parent_span_id);
+  }
+  const diagnosisChecks = rootError
+    ? [
+        `Search ${rootError.type} and the captured message in ${rootError.service} logs around this span; correlate by trace and span ID.`,
+        inventoryShortfall
+          ? `Check ${inventoryShortfall[1]}'s on-hand count and outstanding reservations at this span's timestamp; compare stock updates with concurrent reservation attempts.`
+          : `Check the root service's request inputs and dependency responses at the failure time for the condition described by the error.`,
+        data.symptom_service === data.root_cause_service
+          ? `Inspect the calling hops (${rootCallPath.slice(0, -1).map((node: any) => node.service).join(" → ") || "trace entry"}) to confirm how the error propagated and whether their compensating actions completed.`
+          : `Inspect ${data.symptom_service || "downstream services"} for propagated effects; the symptom may be fallout rather than the origin.`,
+      ]
+    : [
+        `Inspect ${rootNode?.service || data.root_cause_service || "the selected service"} logs and events for the time window of this span; no application error was persisted.`,
+        "Compare the span's local work and dependency calls with a healthy trace to identify which operation accounts for the extra time.",
+        `Check ${data.symptom_service || "downstream services"} for the first visible impact, then trace the failing dependency or request back to the selected service.`,
+      ];
+  const propagationPath = cascadePath.length > 1
+    ? cascadePath.map((service: string) => ({ service }))
+    : rootCallPath.length > 0
+      ? rootCallPath
+      : cascadePath.map((service: string) => ({ service }));
 
   return (
     <main className="container trace-page">
@@ -447,6 +503,37 @@ const TraceDetailView: React.FC = () => {
       <section className={`card diagnosis-banner ${data.root_cause_service ? "has-root" : "healthy"}`}>
         <div className="diagnosis-badges"><span className={`badge ${data.root_cause_service ? "badge-root" : "badge-up"}`}>{data.root_cause_service ? `Root cause: ${data.root_cause_service}` : "healthy trace"}</span>{data.symptom_service && <span className="badge badge-symptom">Symptom: {data.symptom_service}</span>}</div>
         <p>{data.explanation}</p>
+      </section>
+      <section className={`card panel-spaced root-cause-error-card ${rootError ? "has-error" : "no-error"}`}>
+        <div className="card-title"><span>Developer fault diagnosis</span><span className={`badge ${rootError ? "badge-down" : data.root_cause_service ? "badge-symptom" : "badge-up"}`}>{rootError ? "application error captured" : data.root_cause_service ? "timing evidence only" : "no fault detected"}</span></div>
+        <div className="root-diagnosis-grid">
+          <div className="root-diagnosis-summary">
+            <p className="eyebrow">What failed</p>
+            {rootError ? <><h3 className="root-error-type">{rootError.type}</h3><p className="root-error-message">{rootError.message}</p><div className="root-error-interpretation"><strong>What this means</strong><p>{errorInterpretation}</p></div></> : <><h3 className="root-error-type">{data.root_cause_service ? `Suspected origin: ${data.root_cause_service}` : "No root-cause fault identified"}</h3><p className="root-error-message">No application exception was persisted for this trace. {data.root_cause_service ? "The service attribution is inferred from trace measurements; use logs and a healthy comparison to confirm the underlying fault." : "The captured spans stayed within the recorded baseline limits."}</p></>}
+            {(rootError?.span_id || rootNode?.span_id) && <div className="root-span-reference"><span>Root span</span><code>{rootError?.span_id || rootNode?.span_id}</code></div>}
+          </div>
+          <div className="root-evidence-panel">
+            <p className="eyebrow">Why this service was selected</p>
+            <p>{data.root_cause_service ? timingExplanation : "The trace analyzer did not assign a root-cause service. No fault-origin claim is being made from this trace."}</p>
+            {rootNode && <div className="root-evidence-stats">
+              <div><span>Self time</span><strong>{rootNode.self_time_ms ?? "—"}<small> ms</small></strong></div>
+              <div><span>Baseline</span><strong>{rootNode.baseline_mean ?? "—"}<small> ms</small></strong></div>
+              <div><span>Z-score</span><strong>{Number.isFinite(zScore) ? zScore.toFixed(2) : "—"}</strong></div>
+              <div><span>Span status</span><strong className="root-status-value">{rootNode.status || "unknown"}</strong></div>
+            </div>}
+            {rootError && <p className="root-evidence-note">Direct evidence: the captured error is attached to the span the analyzer selected as the root cause.</p>}
+          </div>
+        </div>
+        <div className="root-diagnosis-followup">
+          <div className="root-propagation-panel">
+            <p className="eyebrow">Observed propagation</p>
+            {propagationPath.length > 0 ? <><div className="root-propagation-path">{propagationPath.map((hop: any, index: number) => { const service = typeof hop === "string" ? hop : hop.service; const isOriginAndSymptom = service === data.root_cause_service && service === data.symptom_service; const isOrigin = service === data.root_cause_service; const isSymptom = service === data.symptom_service; return <React.Fragment key={`${service}-${index}`}><span className={isOrigin ? "origin" : isSymptom ? "symptom" : ""}>{service}<small>{isOriginAndSymptom ? "origin + symptom" : isOrigin ? "fault origin" : isSymptom ? "symptom" : index === 0 ? "entry / caller" : "caller hop"}</small></span>{index < propagationPath.length - 1 && <b aria-hidden="true">→</b>}</React.Fragment>; })}</div><p className="root-followup-copy">{data.root_cause_service === data.symptom_service ? <>The fault and its first visible symptom were both recorded in <strong>{data.root_cause_service}</strong>. The call path above shows the upstream callers that may have propagated that failure.</> : <>The symptom at <strong>{data.symptom_service || symptomNode?.service || "the downstream edge"}</strong> is distinct from the selected fault origin{data.root_cause_service ? <> at <strong>{data.root_cause_service}</strong></> : null}; inspect the intermediate hops for propagation.</>}</p></> : <p className="root-followup-copy">No service-to-service call path was recorded for this trace.</p>}
+          </div>
+          <div className="root-next-steps">
+            <p className="eyebrow">What to check next</p>
+            <ol>{diagnosisChecks.map((check: string) => <li key={check}>{check}</li>)}</ol>
+          </div>
+        </div>
       </section>
       <section className="card panel-spaced">
         <div className="card-title"><span>Interactive time-travel replay</span><span className="live-label"><i /> Database-backed rollback markers</span></div>
